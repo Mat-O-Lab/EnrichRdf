@@ -1,16 +1,15 @@
 version: "3"
 services:
-  csvtocsvw:
-    image: "ghcr.io/mat-o-lab/csvtocsvw:latest"
-    container_name: "csvtocsvw"
-    environment:
-      APP_MODE: "production"
-      ADMIN_MAIL: ${ADMIN_MAIL}
+  app:
+    build: .
+    container_name: ${APP_NAME}
+    env_file:
+    - .env
     ports:
       - ${APP_PORT}:5000
     restart: always
     networks:
-      - csvtocsvw_net
+      - app_net
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5000/info"]
       interval: 10s
@@ -18,6 +17,6 @@ services:
       retries: 20
 
 networks:
-  csvtocsvw_net:
-    name: csvtocsvw_net
+  app_net:
+    name: ${APP_NAME}_net
     driver: bridge

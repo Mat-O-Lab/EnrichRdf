@@ -12,14 +12,13 @@ from starlette.responses import HTMLResponse
 import fastapi
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional, Any, Union
-import json
 
 from pydantic import BaseModel, AnyUrl, Field, FileUrl
 
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 #from fastapi.encoders import jsonable_encoder
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 
 from wtforms import URLField, SelectField, FileField
 
@@ -27,9 +26,13 @@ from datetime import datetime
 
 import logging
 
-from annotator import CSV_Annotator, TextEncoding
-from csvw_parser import CSVWtoRDF
 from io import BytesIO
+from rdflib import Graph, BNode, URIRef, Literal
+from rdflib.namespace import PROV, RDF, RDFS, XSD
+from rdflib.util import guess_format
+from urllib.request import urlopen
+from urllib.parse import urlparse
+
 
 def path2url(path):
     return urlparse(path,scheme='file').geturl()
@@ -38,7 +41,6 @@ import settings
 setting = settings.Setting()
 
 from enum import Enum
-
 
 class ReturnType(str, Enum):
     jsonld="json-ld"
@@ -53,7 +55,66 @@ class ReturnType(str, Enum):
     longturtle="longturtle"
     xml="xml"
 
+def get_media_type(format):
+    if format==ReturnType.jsonld:
+        media_type='application/json'
+    elif format==ReturnType.xml:
+        media_type='application/xml'
+    elif format in [ReturnType.turtle, ReturnType.longturtle]:
+        media_type='text/turtle'
+    else:
+        media_type='text/utf-8'
+    return media_type
 
+def parse_graph(url: AnyUrl, graph: Graph = Graph(), format: str = '') -> Graph:
+    """Parse a Graph from web url to rdflib graph object
+
+    Args:
+        url (AnyUrl): Url to an web ressource
+        graph (Graph): Existing Rdflib Graph object to parse data to.
+
+    Returns:
+        Graph: Rdflib graph Object
+    """
+    parsed_url=urlparse(url)
+    if not format:
+        format=guess_format(parsed_url.path)
+    print(parsed_url.path, format)
+    if parsed_url.scheme in ['https', 'http']:
+        graph.parse(urlopen(parsed_url.geturl()).read(), format=format)
+
+    elif parsed_url.scheme in ['file','']:
+        graph.parse(parsed_url.path, format=format)
+    return graph
+
+def add_prov(graph: Graph, api_url: str, data_url: str) -> Graph:
+    """_summary_
+
+    Args:
+        graph (Graph): Graph to add prov information to
+        api_url (str): the api url 
+        data_url (str): the url to the rdf file that was used
+
+    Returns:
+        Graph: Input Graph with prov metadata of the api call 
+    """
+    graph.bind('prov',PROV)
+    
+    root=BNode()
+    api_node=URIRef(api_url)
+    graph.add((root,PROV.wasGeneratedBy,api_node))
+    graph.add((api_node,RDF.type,PROV.Activity))
+    software_node=URIRef(setting.source+"/releases/tag/"+setting.version)
+    graph.add((api_node,PROV.wasAssociatedWith,software_node))
+    graph.add((software_node,RDF.type,PROV.SoftwareAgent))
+    graph.add((software_node,RDFS.label,Literal( setting.name+setting.version)))
+    graph.add((software_node,PROV.hadPrimarySource,URIRef(setting.source)))
+    graph.add((root,PROV.generatedAtTime,Literal(str(datetime.now().isoformat()),datatype=XSD.dateTime)))
+    usage=URIRef(data_url)
+    graph.add((usage,RDF.type,PROV.Usage))
+    graph.add((usage,PROV.hadRole,PROV.Derivation))
+    graph.add((root,PROV.qualifiedUsage,usage))
+    return graph
 
 #flash integration flike flask flash
 def flash(request: fastapi.Request, message: Any, category: str = "info") -> None:
@@ -74,19 +135,29 @@ middleware = [
             ),
     Middleware(uvicorn.middleware.proxy_headers.ProxyHeadersMiddleware, trusted_hosts="*")
     ]
+
+tags_metadata = [
+    {
+        "name": "convert",
+        "description": "converts rdf graphs located on the web.",
+    }
+]
+
 app = fastapi.FastAPI(
-    title="CSVtoCSVW",
-    description="Generates JSON-LD for various types of CSVs, it adopts the Vocabulary provided by w3c at CSVW to describe structure and information within. Also uses QUDT units ontology to lookup and describe units.",
+    title=setting.name,
+    description=setting.desc,
     version=setting.version,
-    contact={"name": "Thomas Hanke, Mat-O-Lab", "url": "https://github.com/Mat-O-Lab", "email": setting.admin_email},
+    contact={"name": setting.contact_name, "url": setting.org_site, "email": setting.admin_email},
     license_info={
         "name": "Apache 2.0",
         "url": "https://www.apache.org/licenses/LICENSE-2.0.html",
     },
     openapi_url=setting.openapi_url,
+    openapi_tags=tags_metadata,
     docs_url=setting.docs_url,
     redoc_url=None,
     swagger_ui_parameters= {'syntaxHighlight': False},
+    swagger_favicon_url="/static/resources/favicon.svg",
     middleware=middleware
 )
 
@@ -95,42 +166,21 @@ app.mount("/static/", StaticFiles(directory='static', html=True), name="static")
 templates= Jinja2Templates(directory="templates")
 templates.env.globals['get_flashed_messages'] = get_flashed_messages
 
-
 logging.basicConfig(level=logging.DEBUG)
 
-class AnnotateRequest(BaseModel):
-    data_url: Union[AnyUrl, FileUrl] = Field('', title='Raw CSV Url', description='Url to raw csv')
-    encoding: Optional[TextEncoding] = Field('auto', title='Encoding', description='Encoding of the file',omit_default=True)
+class ConvertRequest(BaseModel):
+    data_url: Union[AnyUrl, FileUrl] = Field('', title='Raw Data Url', description='Url to raw data')
+    format: Optional[ReturnType] = Field(ReturnType.jsonld, title='Serialization Format', description='The format to use to serialize the rdf.')
+    
     class Config:
-        schema_extra = {
+        json_schema_extra = {
             "example": {
-                "data_url": "https://github.com/Mat-O-Lab/CSVToCSVW/raw/main/examples/example.csv"
+                "data_url": "https://github.com/Mat-O-Lab/CSVToCSVW/raw/main/examples/example-metadata.json",
+                "format": "json-ld"
             }
         }
 
-class AnnotateResponse(BaseModel):
-    filename:  str = Field('example-metadata.json', title='Resulting File Name', description='Suggested filename of the generated json-ld')
-    filedata: dict = Field( title='Generated JSON-LD', description='The generated jdon-ld for the given raw csv file as string in utf-8.')
-
-class RDFRequest(BaseModel):
-    metadata_url: Union[AnyUrl, FileUrl] = Field('', title='Graph Url', description='Url to csvw metadata to use.')
-    csv_url: Optional[Union[AnyUrl, FileUrl]] = Field(None, title='CSV Url', description='Url to csvw file to use or else the mentioned url in metadata will be used.')
-    format: Optional[ReturnType] = Field(ReturnType.jsonld, title='Serialization Format', description='The format to use to serialize the rdf.')
-    class Config:
-        schema_extra = {
-            "examples": [
-                {
-                        "metadata_url": "https://github.com/Mat-O-Lab/CSVToCSVW/raw/main/examples/example2-metadata.json",
-                        "format": "json-ld"
-                },
-                {
-                        "metadata_url": "https://github.com/Mat-O-Lab/CSVToCSVW/raw/main/examples/example2-metadata.json",
-                        "csv_url": "https://github.com/Mat-O-Lab/CSVToCSVW/raw/main/examples/example2.csv",
-                        "format": "turtle"
-                },
-            ]
-        }
-class RDFResponse(BaseModel):
+class ExampleResponse(BaseModel):
     filename:  str = Field('example.ttl', title='Resulting File Name', description='Suggested filename of the generated rdf.')
     filedata: str = Field( title='Generated RDF', description='The generated rdf for the given meta data file as string in utf-8.')
 
@@ -140,21 +190,13 @@ class StartFormUri(StarletteForm):
         #validators=[DataRequired()],
         description='Paste URL to a data file, e.g. csv, TRA',
         #validators=[DataRequired(message='Either URL to data file or file upload is required.')],
-        render_kw={"class":"form-control", "placeholder": "https://github.com/Mat-O-Lab/CSVToCSVW/raw/main/examples/example.csv"},
+        render_kw={"class":"form-control", "placeholder": "https://github.com/Mat-O-Lab/CSVToCSVW/raw/main/examples/example-metadata.json"},
     )
     file=FileField(
-        'Upload CSV File',
-        description='Upload your CSV File here.',
-        render_kw={"class":"form-control", "placeholder": "Your CSV File"},
+        'Upload File',
+        description='Upload your File here.',
+        render_kw={"class":"form-control", "placeholder": "Your File"},
     )
-    encoding = SelectField(
-        'Choose Encoding, default: auto detect',
-        choices= [(encoding.value, encoding.name.capitalize()) for encoding in TextEncoding],
-        render_kw={"class":"form-control"},
-        description='select an encoding for your data manually',
-        default='auto'
-        )
-
 
 
 @app.get('/', response_class=HTMLResponse, include_in_schema=False)
@@ -166,7 +208,8 @@ async def get_index(request: fastapi.Request):
     form = await StartFormUri.from_formdata(request)
     return templates.TemplateResponse(template, {"request": request,
         "form": form,
-        "result": ''
+        "result": '',
+        "setting": setting
         }
     )
 
@@ -194,9 +237,13 @@ async def post_index(request: fastapi.Request):
                 data_url=path2url(file_path)
         elif form.data_url.data:
             data_url=form.data_url.data
-        result= await annotate(request=request,annotate=AnnotateRequest(data_url= data_url, encoding=form.data['encoding']))
-        filename=result["filename"]
-        result=json.dumps(result["filedata"],indent=4)
+        filename=data_url.rsplit('/',1)[-1].rsplit('.',1)[0]
+        graph= parse_graph(data_url)
+        #add prov-o annotations
+        graph=add_prov(graph,request.url._url,data_url)
+        #serialize
+        result=graph.serialize(format='json-ld')
+        filename=filename+'json'
         b64 = base64.b64encode(result.encode())
         payload = b64.decode()
         #remove temp file
@@ -207,69 +254,33 @@ async def post_index(request: fastapi.Request):
         "form": form,
         "result": result,
         "filename": filename,
-        "payload": payload
+        "payload": payload,
+        "setting": setting
         }
     )
 
-def annotate_prov(api_url: str) -> dict:
-        return {
-            "prov:wasGeneratedBy": {
-                "@id": api_url,
-                "@type": "prov:Activity",
-                "prov:wasAssociatedWith":  {
-                    "@id": "https://github.com/Mat-O-Lab/CSVToCSVW/releases/tag/"+setting.version,
-                    "rdfs:label": setting.app_name+setting.version,
-                    "prov:hadPrimarySource": setting.source,
-                    "@type": "prov:SoftwareAgent"
-                }
-            },
-            "prov:generatedAtTime": {
-                    "@value": str(datetime.now().isoformat()),
-                    "@type": "xsd:dateTime"
-                }
-            }
-
-@app.post("/api/annotate",response_model=AnnotateResponse)
-async def annotate(request: fastapi.Request, annotate: AnnotateRequest) -> dict:
-    annotator = CSV_Annotator(annotate.data_url, encoding=annotate.encoding)
-    result=annotator.annotate()
-    result["filedata"]={**result["filedata"],**annotate_prov(request.url._url)}
-    return result
-
-@app.post("/api/annotate_upload",response_model=AnnotateResponse)
-async def annotate_upload(request: fastapi.Request, file: fastapi.UploadFile = fastapi.File(...), encoding: TextEncoding=TextEncoding.DETECT) -> dict:
-    with open(file.filename, "wb") as f:
-        f.write(await file.read())
-    annotator = CSV_Annotator("file://"+os.getcwd()+'/'+file.filename, encoding=encoding.value)
-    result=annotator.annotate()
-    result["filedata"]={**result["filedata"],**annotate_prov(request.url._url)}
-    #delete the temp csv file
-    if os.path.isfile(file.filename):
-        os.remove(file.filename)
-    return result
-
-
-@app.post("/api/rdf")
-async def rdf(request: fastapi.Request, rdfrequest: RDFRequest) -> StreamingResponse:
-    converter=CSVWtoRDF(rdfrequest.metadata_url,rdfrequest.csv_url, request.url._url)
-    filedata=converter.convert(rdfrequest.format.value)
-    data_bytes=BytesIO(filedata.encode())
-    filename=converter.filename
+@app.post("/api/convert", tags=["convert"])
+async def convert(request: fastapi.Request, convert_request: ConvertRequest) -> StreamingResponse:
+    data_url=str(convert_request.data_url)
+    graph= parse_graph(data_url)
+    #add prov-o annotations
+    graph=add_prov(graph,request.url._url,data_url)
+    result=graph.serialize(format=convert_request.format.value)
+    
+    filename=data_url.rsplit('/',1)[-1].rsplit('.',1)[0]
+    if convert_request.format.value in ['turtle','longturtle']:
+        filename+='.ttl'
+    elif convert_request.format.value=='json-ld':
+        filename+='.json'
+    else:
+        filename+='.'+convert_request.format.value 
+    data_bytes=BytesIO(result.encode())
     headers = {
         'Content-Disposition': 'attachment; filename={}'.format(filename),
         'Access-Control-Expose-Headers': 'Content-Disposition'
     }
-    if rdfrequest.format==ReturnType.jsonld:
-        media_type='application/json'
-    elif rdfrequest.format==ReturnType.xml:
-        media_type='application/xml'
-    elif rdfrequest.format in [ReturnType.turtle, ReturnType.longturtle]:
-        media_type='text/turtle'
-    else:
-        media_type='text/utf-8'
+    media_type=get_media_type(convert_request.format)
     return StreamingResponse(content=data_bytes, media_type=media_type, headers=headers)
-
-    
 
 @app.get("/info", response_model=settings.Setting)
 async def info() -> dict:
