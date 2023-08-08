@@ -2,40 +2,34 @@
 import os
 import base64
 from urllib.parse import urlparse
+from urllib.request import urlopen
+
+from datetime import datetime
+import logging
+from io import BytesIO
 
 import uvicorn
+
 from starlette_wtf import StarletteForm, CSRFProtectMiddleware, csrf_protect
 from starlette.middleware import Middleware
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.responses import HTMLResponse
-#from starlette.middleware.cors import CORSMiddleware
-import fastapi
-from fastapi.middleware.cors import CORSMiddleware
-from typing import Optional, Any, Union
-
-from pydantic import BaseModel, AnyUrl, Field, FileUrl
-
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
-#from fastapi.encoders import jsonable_encoder
-from fastapi.responses import StreamingResponse, FileResponse
-
 from wtforms import URLField, SelectField, FileField
 
-from datetime import datetime
+#from starlette.middleware.cors import CORSMiddleware
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from fastapi import Request, HTTPException, FastAPI
+from fastapi.responses import StreamingResponse
 
-import logging
 
-from io import BytesIO
+from typing import Optional, Any, Union
+from pydantic import BaseModel, AnyUrl, Field, FileUrl
+
 from rdflib import Graph, BNode, URIRef, Literal
 from rdflib.namespace import PROV, RDF, RDFS, XSD
 from rdflib.util import guess_format
-from urllib.request import urlopen
-from urllib.parse import urlparse
-
-
-def path2url(path):
-    return urlparse(path,scheme='file').geturl()
 
 import settings
 setting = settings.Setting()
@@ -55,7 +49,18 @@ class ReturnType(str, Enum):
     longturtle="longturtle"
     xml="xml"
 
-def get_media_type(format):
+def path2url(path):
+    
+    return urlparse(path,scheme='file').geturl()
+
+def get_media_type(format: str) -> str:
+    """ Returns a mime type for a Response of serialized rdf
+    Args:
+        format (str): format as one of ["json-ld","n3","nt","hext","trig","turtle","longturtle","xml"]
+
+    Returns:
+        str: mime type, for example "application/xml"
+    """
     if format==ReturnType.jsonld:
         media_type='application/json'
     elif format==ReturnType.xml:
@@ -72,6 +77,7 @@ def parse_graph(url: AnyUrl, graph: Graph = Graph(), format: str = '') -> Graph:
     Args:
         url (AnyUrl): Url to an web ressource
         graph (Graph): Existing Rdflib Graph object to parse data to.
+        format (str):  rdf format as one of ["json-ld","n3","nt","hext","trig","turtle","longturtle","xml"]
 
     Returns:
         Graph: Rdflib graph Object
@@ -88,7 +94,7 @@ def parse_graph(url: AnyUrl, graph: Graph = Graph(), format: str = '') -> Graph:
     return graph
 
 def add_prov(graph: Graph, api_url: str, data_url: str) -> Graph:
-    """_summary_
+    """ Add prov-o information to output graph
 
     Args:
         graph (Graph): Graph to add prov information to
@@ -117,12 +123,12 @@ def add_prov(graph: Graph, api_url: str, data_url: str) -> Graph:
     return graph
 
 #flash integration flike flask flash
-def flash(request: fastapi.Request, message: Any, category: str = "info") -> None:
+def flash(request: Request, message: Any, category: str = "info") -> None:
     if "_messages" not in request.session:
         request.session["_messages"] = []
     request.session["_messages"].append({"message": message, "category": category})
 
-def get_flashed_messages(request: fastapi.Request):
+def get_flashed_messages(request: Request):
     return request.session.pop("_messages") if "_messages" in request.session else []
 
 middleware = [
@@ -138,12 +144,12 @@ middleware = [
 
 tags_metadata = [
     {
-        "name": "convert",
-        "description": "converts rdf graphs located on the web.",
+        "name": "transform",
+        "description": "transforms data to other format",
     }
 ]
 
-app = fastapi.FastAPI(
+app = FastAPI(
     title=setting.name,
     description=setting.desc,
     version=setting.version,
@@ -157,7 +163,7 @@ app = fastapi.FastAPI(
     docs_url=setting.docs_url,
     redoc_url=None,
     swagger_ui_parameters= {'syntaxHighlight': False},
-    swagger_favicon_url="/static/resources/favicon.svg",
+    #swagger_favicon_url="/static/resources/favicon.svg",
     middleware=middleware
 )
 
@@ -201,7 +207,7 @@ class StartFormUri(StarletteForm):
 
 @app.get('/', response_class=HTMLResponse, include_in_schema=False)
 @csrf_protect
-async def get_index(request: fastapi.Request):
+async def get_index(request: Request):
     """GET /: form handler
     """
     template="index.html"
@@ -216,7 +222,7 @@ async def get_index(request: fastapi.Request):
 
 @app.post('/', response_class=HTMLResponse, include_in_schema=False)
 @csrf_protect
-async def post_index(request: fastapi.Request):
+async def post_index(request: Request):
     """POST /: form handler
     """
     template="index.html"
@@ -238,15 +244,19 @@ async def post_index(request: fastapi.Request):
         elif form.data_url.data:
             data_url=form.data_url.data
         filename=data_url.rsplit('/',1)[-1].rsplit('.',1)[0]
-        graph= parse_graph(data_url)
-        #add prov-o annotations
-        graph=add_prov(graph,request.url._url,data_url)
-        #serialize
-        result=graph.serialize(format='json-ld')
-        filename=filename+'json'
-        b64 = base64.b64encode(result.encode())
-        payload = b64.decode()
-        #remove temp file
+        try:
+            graph= parse_graph(data_url)
+        except Exception as e:
+            flash(request,e, category="error")
+        else:    
+            #add prov-o annotations
+            graph=add_prov(graph,request.url._url,data_url)
+            #serialize
+            result=graph.serialize(format='json-ld')
+            filename=filename+'json'
+            b64 = base64.b64encode(result.encode())
+            payload = b64.decode()
+            #remove temp file
         if form.file.data.filename:
             os.remove(file_path)
     # return response
@@ -259,10 +269,25 @@ async def post_index(request: fastapi.Request):
         }
     )
 
-@app.post("/api/convert", tags=["convert"])
-async def convert(request: fastapi.Request, convert_request: ConvertRequest) -> StreamingResponse:
+@app.post("/api/convert", tags=["transform"])
+async def convert(request: Request, convert_request: ConvertRequest) -> StreamingResponse:
+    """Converts a rdf file on the web to the specified serializatio format.
+
+    Args:
+        request (Request): general request
+        convert_request (ConvertRequest): convert informatation
+
+    Raises:
+        HTTPException: Error description
+
+    Returns:
+        StreamingResponse: RDF Output File as Streaming Response
+    """
     data_url=str(convert_request.data_url)
-    graph= parse_graph(data_url)
+    try:
+        graph= parse_graph(data_url)
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=str(e))
     #add prov-o annotations
     graph=add_prov(graph,request.url._url,data_url)
     result=graph.serialize(format=convert_request.format.value)
@@ -284,12 +309,17 @@ async def convert(request: fastapi.Request, convert_request: ConvertRequest) -> 
 
 @app.get("/info", response_model=settings.Setting)
 async def info() -> dict:
+    """App Information
+
+    Returns:
+        dict: Provinance information of the App.
+    """
     return setting
 
 #time http calls
 from time import time
 @app.middleware("http")
-async def add_process_time_header(request: fastapi.Request, call_next):
+async def add_process_time_header(request: Request, call_next):
     start_time = time()
     response = await call_next(request)
     process_time = time() - start_time
