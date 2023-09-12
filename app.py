@@ -116,10 +116,15 @@ def add_prov(graph: Graph, api_url: str, data_url: str) -> Graph:
     graph.add((software_node,RDFS.label,Literal( setting.name+setting.version)))
     graph.add((software_node,PROV.hadPrimarySource,URIRef(setting.source)))
     graph.add((root,PROV.generatedAtTime,Literal(str(datetime.now().isoformat()),datatype=XSD.dateTime)))
-    usage=URIRef(data_url)
-    graph.add((usage,RDF.type,PROV.Usage))
-    graph.add((usage,PROV.hadRole,PROV.Derivation))
-    graph.add((root,PROV.qualifiedUsage,usage))
+    entity=URIRef(str(data_url))
+    graph.add((entity,RDF.type,PROV.Entity))
+    derivation=BNode()
+    graph.add((derivation,RDF.type,PROV.Derivation))
+    graph.add((derivation,PROV.entity,entity))
+    graph.add((derivation,PROV.hadActivity,api_node))
+    graph.add((root,PROV.qualifiedDerivation,derivation))
+    graph.add((root,PROV.wasDerivedFrom,entity))
+    
     return graph
 
 #flash integration flike flask flash
