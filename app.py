@@ -22,7 +22,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi import Request, HTTPException, FastAPI
 from fastapi.responses import StreamingResponse
-
+from fastapi import Depends
 
 from typing import Optional, Any, Union
 from pydantic import BaseModel, AnyUrl, Field, FileUrl
@@ -31,23 +31,35 @@ from rdflib import Graph, BNode, URIRef, Literal
 from rdflib.namespace import PROV, RDF, RDFS, XSD
 from rdflib.util import guess_format
 
+import robot
+import util
+
+
 import settings
 setting = settings.Setting()
 
 from enum import Enum
 
 class ReturnType(str, Enum):
-    jsonld="json-ld"
-    n3="n3"
-    #nquads="nquads" #only makes sense for context-aware stores
-    nt="nt"
-    hext="hext"
+    #done by rdflib
+    jsonld="Json-ld"
+    nquads="N-Quads" #only makes sense for context-aware stores
+    nt="N-Triples"
+    n3="Notation-3"
     #prettyxml="pretty-xml" #only makes sense for context-aware stores
-    trig="trig"
-    #trix="trix" #only makes sense for context-aware stores
-    turtle="turtle"
-    longturtle="longturtle"
-    xml="xml"
+    trig="Trig"
+    hext="Hex-Tuples"
+    trix="Trix" #only makes sense for context-aware stores
+    longturtle="LongTurtle"
+    #done by robot
+    json="OBO-json"
+    turtle="Turtle"
+    #longturtle="longturtle"
+    rdf="RDF/XML"
+    owl="OWL/XML"
+    omn="Manchester"
+    ofn="OWL-Functional"
+    obo="OBO-Format"
 
 def path2url(path):
     
@@ -62,11 +74,21 @@ def get_media_type(format: str) -> str:
         str: mime type, for example "application/xml"
     """
     if format==ReturnType.jsonld:
+        media_type='application/ld+json'
+    elif format==ReturnType.json:
         media_type='application/json'
-    elif format==ReturnType.xml:
+    elif format==ReturnType.rdf:
         media_type='application/xml'
-    elif format in [ReturnType.turtle, ReturnType.longturtle]:
+    elif format==ReturnType.owl:
+        media_type='application/owl+xml'
+    elif format==ReturnType.ofn:
+        media_type='text/owl-functional'
+    elif format==ReturnType.obo:
+        media_type='text/plain'
+    elif format in [ReturnType.turtle,ReturnType.longturtle]:
         media_type='text/turtle'
+    elif format in [ReturnType.omn,]:
+        media_type="text/owl-manchester"
     else:
         media_type='text/utf-8'
     return media_type
@@ -93,7 +115,121 @@ def parse_graph(url: AnyUrl, graph: Graph = Graph(), format: str = '') -> Graph:
         graph.parse(parsed_url.path, format=format)
     return graph
 
-def add_prov(graph: Graph, api_url: str, data_url: str) -> Graph:
+
+#flash integration flike flask flash
+def flash(request: Request, message: Any, category: str = "info") -> None:
+    if "_messages" not in request.session:
+        request.session["_messages"] = []
+    request.session["_messages"].append({"message": message, "category": category})
+
+def get_flashed_messages(request: Request):
+    return request.session.pop("_messages") if "_messages" in request.session else []
+
+middleware = [
+    Middleware(SessionMiddleware, secret_key=os.environ.get('APP_SECRET','changemeNOW')),
+    Middleware(CSRFProtectMiddleware, csrf_secret=os.environ.get('APP_SECRET','changemeNOW')),
+    Middleware(CORSMiddleware, 
+            allow_origins=["*"], # Allows all origins
+            allow_methods=["*"], # Allows all methods
+            allow_headers=["*"] # Allows all headers
+            ),
+    Middleware(uvicorn.middleware.proxy_headers.ProxyHeadersMiddleware, trusted_hosts="*")
+    ]
+
+tags_metadata = [
+    {
+        "name": "transform",
+        "description": "transforms data to other format",
+    },
+    {
+        "name": "analyse",
+        "description": "generates a report about the subject",
+    },
+        {
+        "name": "enrich",
+        "description": "adds information to the input dataset",
+    }
+
+]
+
+app = FastAPI(
+    title=setting.name,
+    description=setting.desc,
+    version=setting.version,
+    contact={"name": setting.contact_name, "url": setting.org_site, "email": setting.admin_email},
+    license_info={
+        "name": "Apache 2.0",
+        "url": "https://www.apache.org/licenses/LICENSE-2.0.html",
+    },
+    openapi_url=setting.openapi_url,
+    openapi_tags=tags_metadata,
+    docs_url=setting.docs_url,
+    redoc_url=None,
+    swagger_ui_parameters= {'syntaxHighlight': False},
+    #swagger_favicon_url="/static/resources/favicon.svg",
+    middleware=middleware
+)
+
+
+app.mount("/static/", StaticFiles(directory='static', html=True), name="static")
+templates= Jinja2Templates(directory="templates")
+templates.env.globals['get_flashed_messages'] = get_flashed_messages
+
+logging.basicConfig(level=logging.DEBUG)
+
+class ConvertRequest(BaseModel):
+    data_url: Union[AnyUrl, FileUrl] = Field('https://github.com/Mat-O-Lab/CSVToCSVW/raw/refs/heads/main/examples/example-metadata.json', title='Data Url', description='Url of data to convert')
+    format: ReturnType = Field(ReturnType.turtle, title='Serialization Format', description='The format to convert to.')
+    
+class AnalyseRequest(BaseModel):
+    data_url: Union[AnyUrl, FileUrl] = Field('', title='Raw Data Url', description='Url of data to analyse')
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "data_url": "https://kupferdigital.gitlab.io/process-graphs/vickers-hardness-test-fem/index.ttl",
+            }
+        }
+
+class ReasonRequest(BaseModel):
+    data_url: Union[AnyUrl, FileUrl] = Field('', title='Raw Data Url', description='Url to raw data')
+    reasoner: robot.Reasoner = Field(robot.Reasoner.ELK, title='Reasoner to Use', description='The type of Reasoner to use on the dataset.')
+    format: Optional[ReturnType] = Field(ReturnType.turtle, title='Serialization Format', description='The format to use to serialize the rdf.')
+    load_referenced_ontologies: Optional[bool] = Field(
+        False,
+        title="Load all ontologies from prefixes.",
+        description="If to load all ontologies used prior to reasoning.",
+        omit_default=True,
+    )
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "data_url": "https://kupferdigital.gitlab.io/process-graphs/vickers-hardness-test-fem/index.ttl",
+                "load_referenced_ontologies": False,
+                "reasoner": "ELK",
+                "format": "turtle"
+            }
+        }
+
+class ExampleResponse(BaseModel):
+    filename:  str = Field('example.ttl', title='Resulting File Name', description='Suggested filename of the generated rdf.')
+    filedata: str = Field( title='Generated RDF', description='The generated rdf for the given meta data file as string in utf-8.')
+
+class StartFormUri(StarletteForm):
+    data_url = URLField(
+        'URL Data File',
+        #validators=[DataRequired()],
+        description='Paste URL to a data file, e.g. csv, TRA',
+        #validators=[DataRequired(message='Either URL to data file or file upload is required.')],
+        render_kw={"class":"form-control", "placeholder": "https://github.com/Mat-O-Lab/CSVToCSVW/raw/main/examples/example-metadata.json"},
+    )
+    file=FileField(
+        'Upload File',
+        description='Upload your File here.',
+        render_kw={"class":"form-control", "placeholder": "Your File"},
+    )
+
+def add_prov(graph: Graph, api_url: str, data_url: str, used: list = []) -> Graph:
     """ Add prov-o information to output graph
 
     Args:
@@ -124,90 +260,9 @@ def add_prov(graph: Graph, api_url: str, data_url: str) -> Graph:
     graph.add((derivation,PROV.hadActivity,api_node))
     graph.add((root,PROV.qualifiedDerivation,derivation))
     graph.add((root,PROV.wasDerivedFrom,entity))
-    
+    if used:
+        [graph.add((api_node,PROV.wasInformedBy,URIRef(entry))) for entry in used]
     return graph
-
-#flash integration flike flask flash
-def flash(request: Request, message: Any, category: str = "info") -> None:
-    if "_messages" not in request.session:
-        request.session["_messages"] = []
-    request.session["_messages"].append({"message": message, "category": category})
-
-def get_flashed_messages(request: Request):
-    return request.session.pop("_messages") if "_messages" in request.session else []
-
-middleware = [
-    Middleware(SessionMiddleware, secret_key=os.environ.get('APP_SECRET','changemeNOW')),
-    Middleware(CSRFProtectMiddleware, csrf_secret=os.environ.get('APP_SECRET','changemeNOW')),
-    Middleware(CORSMiddleware, 
-            allow_origins=["*"], # Allows all origins
-            allow_methods=["*"], # Allows all methods
-            allow_headers=["*"] # Allows all headers
-            ),
-    Middleware(uvicorn.middleware.proxy_headers.ProxyHeadersMiddleware, trusted_hosts="*")
-    ]
-
-tags_metadata = [
-    {
-        "name": "transform",
-        "description": "transforms data to other format",
-    }
-]
-
-app = FastAPI(
-    title=setting.name,
-    description=setting.desc,
-    version=setting.version,
-    contact={"name": setting.contact_name, "url": setting.org_site, "email": setting.admin_email},
-    license_info={
-        "name": "Apache 2.0",
-        "url": "https://www.apache.org/licenses/LICENSE-2.0.html",
-    },
-    openapi_url=setting.openapi_url,
-    openapi_tags=tags_metadata,
-    docs_url=setting.docs_url,
-    redoc_url=None,
-    swagger_ui_parameters= {'syntaxHighlight': False},
-    #swagger_favicon_url="/static/resources/favicon.svg",
-    middleware=middleware
-)
-
-
-app.mount("/static/", StaticFiles(directory='static', html=True), name="static")
-templates= Jinja2Templates(directory="templates")
-templates.env.globals['get_flashed_messages'] = get_flashed_messages
-
-logging.basicConfig(level=logging.DEBUG)
-
-class ConvertRequest(BaseModel):
-    data_url: Union[AnyUrl, FileUrl] = Field('', title='Raw Data Url', description='Url to raw data')
-    format: Optional[ReturnType] = Field(ReturnType.jsonld, title='Serialization Format', description='The format to use to serialize the rdf.')
-    
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "data_url": "https://github.com/Mat-O-Lab/CSVToCSVW/raw/main/examples/example-metadata.json",
-                "format": "json-ld"
-            }
-        }
-
-class ExampleResponse(BaseModel):
-    filename:  str = Field('example.ttl', title='Resulting File Name', description='Suggested filename of the generated rdf.')
-    filedata: str = Field( title='Generated RDF', description='The generated rdf for the given meta data file as string in utf-8.')
-
-class StartFormUri(StarletteForm):
-    data_url = URLField(
-        'URL Data File',
-        #validators=[DataRequired()],
-        description='Paste URL to a data file, e.g. csv, TRA',
-        #validators=[DataRequired(message='Either URL to data file or file upload is required.')],
-        render_kw={"class":"form-control", "placeholder": "https://github.com/Mat-O-Lab/CSVToCSVW/raw/main/examples/example-metadata.json"},
-    )
-    file=FileField(
-        'Upload File',
-        description='Upload your File here.',
-        render_kw={"class":"form-control", "placeholder": "Your File"},
-    )
 
 
 @app.get('/', response_class=HTMLResponse, include_in_schema=False)
@@ -274,13 +329,14 @@ async def post_index(request: Request):
         }
     )
 
+import tempfile
 @app.post("/api/convert", tags=["transform"])
-async def convert(request: Request, convert_request: ConvertRequest) -> StreamingResponse:
-    """Converts a rdf file on the web to the specified serializatio format.
+async def convert(convert_query: ConvertRequest = Depends()
+) -> StreamingResponse:
+    """Converts a rdf file on the web to the specified serialization format.
 
     Args:
-        request (Request): general request
-        convert_request (ConvertRequest): convert informatation
+        convert_request (ConvertRequest): convert information
 
     Raises:
         HTTPException: Error description
@@ -288,29 +344,123 @@ async def convert(request: Request, convert_request: ConvertRequest) -> Streamin
     Returns:
         StreamingResponse: RDF Output File as Streaming Response
     """
-    data_url=str(convert_request.data_url)
+    #data_url=str(convert_request.data_url)
+    data_url=convert_query.data_url.unicode_string()
+    return_type=convert_query.format
+    filename=data_url.rsplit('/',1)[-1].rsplit('.',1)[0]
+    if return_type in [ReturnType.omn,ReturnType.json,ReturnType.ofn,ReturnType.obo]:
+        filename+='.'+return_type.name
+        format=return_type.name
+    elif return_type is ReturnType.rdf:
+        filename+='.rdf'
+        format='owl'
+    elif return_type is ReturnType.owl:
+        filename+='.owx'
+        format='owx'
+    else:
+        filename+='.ttl'
+        format='ttl'
+    try:
+        result, filename=robot.convert(data_url, filename, format)
+    except robot.RobotExeption as e:
+            msg=str(e)
+            if 'Not a valid (absolute) IRI: @context' in msg:
+                print('seams to be jsonld - trying to seralize to turtle and run again')
+                try:
+                    graph= parse_graph(data_url)
+                except Exception as e:
+                    raise HTTPException(status_code=404, detail=str(e))
+                #add prov-o annotations
+                #graph=add_prov(graph,request.url._url,data_url)
+
+                temp_name='temp_'+data_url.rsplit('/',1)[-1].rsplit('.',1)[0]+'.ttl'
+                graph.serialize(temp_name)
+                file_path=os.path.realpath(temp_name)
+                # try robot again
+                try:
+                    result, filename=robot.convert(file_path, filename, format)
+                except robot.RobotExeption as e:
+                    msg=str(e)
+                    raise HTTPException(status_code=400, detail=msg)
+                os.remove(temp_name)
+            else:
+                raise HTTPException(status_code=400, detail=msg)
+    #now use rdflib for additional formats
+    if return_type in [ReturnType.jsonld,ReturnType.nt,ReturnType.n3,ReturnType.trig,ReturnType.trix,ReturnType.nquads,ReturnType.hext,ReturnType.longturtle]:
+        if return_type is ReturnType.jsonld:
+            filename+='.jsonld'
+            format='json-ld'
+        elif return_type is ReturnType.nt:
+            filename+='.nt'
+            format='nt11'
+        elif return_type is ReturnType.longturtle:
+            filename+='.ttl'
+            format=return_type.name
+        else:
+            filename+='.'+return_type.name
+            format=return_type.name
+        with tempfile.NamedTemporaryFile(mode='wb') as temp_file:
+            temp_file.write(result)
+            temp_file.seek(0)
+            try:
+                graph=Graph().parse(temp_file.name,format='turtle')
+            except Exception as e:
+                raise HTTPException(status_code=404, detail=str(e))
+        #add prov-o annotations
+        #graph=add_prov(graph,request.url._url,data_url)
+        result=graph.serialize(format=format).encode()
+    
+    
+    data_bytes=BytesIO(result)
+    headers = {
+        'Content-Disposition': 'attachment; filename={}'.format(filename),
+        'Access-Control-Expose-Headers': 'Content-Disposition'
+    }
+    media_type=get_media_type(return_type)
+    return StreamingResponse(content=data_bytes, media_type=media_type, headers=headers)
+
+@app.post("/api/reason", tags=["transform"])
+async def reason(request: Request, reason_request: ReasonRequest) -> StreamingResponse:
+    data_url=str(reason_request.data_url)
+    filename=data_url.rsplit('/',1)[-1].rsplit('.',1)[0]
     try:
         graph= parse_graph(data_url)
     except Exception as e:
         raise HTTPException(status_code=404, detail=str(e))
+    if reason_request.load_referenced_ontologies:
+        graph, loaded = util.import_ontologies_from_prefixes(graph)
+        onto_uris=[entry[2]for entry in loaded if entry[3]=='True']
+    else:
+        onto_uris=[]
+    res=robot.reason(graph,reasoner=reason_request.reasoner.value)
     #add prov-o annotations
-    graph=add_prov(graph,request.url._url,data_url)
-    result=graph.serialize(format=convert_request.format.value)
-    
-    filename=data_url.rsplit('/',1)[-1].rsplit('.',1)[0]
-    if convert_request.format.value in ['turtle','longturtle']:
+    res=add_prov(res,request.url._url,data_url,used=onto_uris)
+    result=res.serialize(format=reason_request.format.value)
+    if reason_request.format.value in ['turtle','longturtle']:
         filename+='.ttl'
-    elif convert_request.format.value=='json-ld':
+    elif reason_request.format.value=='json-ld':
         filename+='.json'
     else:
-        filename+='.'+convert_request.format.value 
+        filename+='.'+reason_request.format.value 
     data_bytes=BytesIO(result.encode())
     headers = {
         'Content-Disposition': 'attachment; filename={}'.format(filename),
         'Access-Control-Expose-Headers': 'Content-Disposition'
     }
-    media_type=get_media_type(convert_request.format)
+    media_type=get_media_type(reason_request.format)
     return StreamingResponse(content=data_bytes, media_type=media_type, headers=headers)
+
+@app.post("/api/analyse", tags=["transform"])
+async def analyse(request: Request, analyse_request: AnalyseRequest):
+    data_url=str(analyse_request.data_url)
+    #filename=data_url.rsplit('/',1)[-1].rsplit('.',1)[0]
+    try:
+        graph= parse_graph(data_url)
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    res=robot.analyse(graph)
+    return res
+
 
 @app.get("/info", response_model=settings.Setting)
 async def info() -> dict:
