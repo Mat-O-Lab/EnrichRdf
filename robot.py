@@ -92,26 +92,44 @@ def convert(file_loc: str, outname, format='ttl')-> bytes:
     raw_bytes=run_robot_convert(file_path,outname,format)
     return raw_bytes, outname
 
-def analyse(g=Graph(), format: str="json") -> str:
-    temp_id=str(uuid.uuid4())
-    output_path=os.path.join(_HERE, temp_id+'.'+format)
-    input_path=os.path.join(_HERE, temp_id+'.owl')
-    #convert_path=os.path.join(_HERE, 'output.ttl')
-    g.serialize(input_path,format='application/rdf+xml')
-    command = ["robot", "report", "-i", input_path, "-o", output_path]
+def analyse(file_loc: str, outname: str, format: str="json") -> str:
+    file_path=Path(file_loc)
+    if file_path.exists():
+        print("got file location")
+        file_path=file_path.as_posix()
+    else:
+        response = requests.get(file_loc)
+        if response.status_code == 200:
+            #print(response.headers)
+            if 'Content-Disposition' in response.headers:
+                content_disposition = response.headers['Content-Disposition']
+                filename = content_disposition.split('filename=')[-1].strip('"')
+            else:
+                filename=file_loc.rsplit('/',1)[-1]
+        
+            with open(filename,"wb") as f:
+                f.write(response.content)
+            file_path=filename
+            print(f"File downloaded to {file_path}")
+        else:
+            print("Failed to download file:", response.status_code)
+            return None
+            
+            #outname=file_loc.rsplit('/',1)[-1].rsplit('.',1)[0]+'.'+format
+    command = ["robot", "report", "-i", file_path, "-o", outname]
     logging.debug("* Running Robot Report...")
     try:
         output = subprocess.check_output(command, stderr = subprocess.STDOUT)
     except subprocess.CalledProcessError as e:
-        if os.path.isfile(output_path):
+        if os.path.isfile(outname):
             pass
         else:
-            os.remove(input_path)
             raise HTTPException(status_code=400, detail="Java error message is: {}".format(e.stderr or e.output or b""))
-    os.remove(input_path)
-    with open(output_path,"rb") as f:
+    finally:
+        os.remove(file_path)
+    with open(outname,"rb") as f:
         res=json.load(f)
-    os.remove(output_path)
+    os.remove(outname)
     return res
 
     

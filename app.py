@@ -182,7 +182,7 @@ class ConvertRequest(BaseModel):
     format: ReturnType = Field(ReturnType.turtle, title='Serialization Format', description='The format to convert to.')
     
 class AnalyseRequest(BaseModel):
-    data_url: Union[AnyUrl, FileUrl] = Field('', title='Raw Data Url', description='Url of data to analyse')
+    data_url: Union[AnyUrl, FileUrl] = Field('', title='OWL File', description='Url of OWL file to analyse')
     
     class Config:
         json_schema_extra = {
@@ -331,9 +331,9 @@ async def post_index(request: Request):
 
 import tempfile
 @app.post("/api/convert", tags=["transform"])
-async def convert(convert_query: ConvertRequest = Depends()
+async def convert(convert_query: ConvertRequest
 ) -> StreamingResponse:
-    """Converts a rdf file on the web to the specified serialization format.
+    """Converts a semantic data files on the web to the specified serialization format.
 
     Args:
         convert_request (ConvertRequest): convert information
@@ -419,7 +419,7 @@ async def convert(convert_query: ConvertRequest = Depends()
     media_type=get_media_type(return_type)
     return StreamingResponse(content=data_bytes, media_type=media_type, headers=headers)
 
-@app.post("/api/reason", tags=["transform"])
+@app.post("/api/reason", tags=["enrich"])
 async def reason(request: Request, reason_request: ReasonRequest) -> StreamingResponse:
     data_url=str(reason_request.data_url)
     filename=data_url.rsplit('/',1)[-1].rsplit('.',1)[0]
@@ -450,15 +450,22 @@ async def reason(request: Request, reason_request: ReasonRequest) -> StreamingRe
     media_type=get_media_type(reason_request.format)
     return StreamingResponse(content=data_bytes, media_type=media_type, headers=headers)
 
-@app.post("/api/analyse", tags=["transform"])
-async def analyse(request: Request, analyse_request: AnalyseRequest):
+@app.post("/api/analyse", tags=["analyse"])
+async def analyse(analyse_request: AnalyseRequest):
+    """Analyses owl syntax files on the web for syntax errors.
+
+    Args:
+        analyse_request (AnalyseRequest): file information
+
+    Raises:
+        HTTPException: Error description
+
+    Returns:
+        JSONResponse: Json Output File with errors and warnings
+    """
     data_url=str(analyse_request.data_url)
-    #filename=data_url.rsplit('/',1)[-1].rsplit('.',1)[0]
-    try:
-        graph= parse_graph(data_url)
-    except Exception as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    res=robot.analyse(graph)
+    filename=data_url.rsplit('/',1)[-1].rsplit('.',1)[0]+'.json'
+    res=robot.analyse(data_url,filename)
     return res
 
 
